@@ -1,0 +1,257 @@
+import os
+import logging
+import argparse
+import numpy as np
+from tqdm import tqdm
+from datetime import datetime
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch_scatter import scatter_mean
+from torch_geometric.loader import DataLoader
+
+from models.nn import RGCNConv
+from Process.rand5fold import load5foldData
+from Process.process import loadMixDataGcl
+from tools.evaluate import evaluationclass
+from tools.earlystopping import EarlyStopping
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+def SimSiamMLP(dim, projection_size, hidden_size):
+    return nn.Sequential(
+        nn.Linear(dim, hidden_size, bias=False),
+        nn.BatchNorm1d(hidden_size),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_size, hidden_size, bias=False),
+        nn.BatchNorm1d(hidden_size),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_size, projection_size, bias=False),
+        nn.BatchNorm1d(projection_size, affine=False)
+    )
+
+def MLP(dim, projection_size, hidden_size):
+    return nn.Sequential(
+        nn.Linear(dim, hidden_size),
+        nn.BatchNorm1d(hidden_size),
+        nn.ReLU(inplace=True),
+        nn.Linear(hidden_size, projection_size)
+    )
+
+class RGCN(nn.Module):
+    def __init__(self, in_dim_t, in_dim_p, hid_dim, out_dim):
+        super(RGCN, self).__init__()
+        self.text_conv1 = RGCNConv(in_dim_t, hid_dim, num_relations=2)
+        self.text_conv2 = RGCNConv(hid_dim, out_dim, num_relations=2)
+        self.text_bn1 = nn.BatchNorm1d(hid_dim)
+        self.text_bn2 = nn.BatchNorm1d(out_dim)
+        
+        self.prop_conv1 = RGCNConv(in_dim_p, hid_dim, num_relations=2)
+        self.prop_conv2 = RGCNConv(hid_dim, out_dim, num_relations=2)        
+        self.prop_bn1 = nn.BatchNorm1d(hid_dim)
+        self.prop_bn2 = nn.BatchNorm1d(out_dim)
+
+        self.relu = nn.LeakyReLU(negative_slope=0.01)
+        
+    def forward(self, data, CL=False):
+        ## propagation graph
+        if CL:
+            x_p, edge_index_p, edge_type_p, batch_p = data.x_p_1, data.edge_index_p_1, data.edge_type_p_1, data.x_p_1_batch
+        else:        
+            x_p, edge_index_p, edge_type_p, batch_p = data.x_p, data.edge_index_p, data.edge_type_p, data.x_p_batch
+        x_p = self.prop_conv1(x_p, edge_index_p, edge_type_p)
+        x_p = self.relu(self.prop_bn1(x_p))
+
+        x_p = self.prop_conv2(x_p, edge_index_p, edge_type_p)
+        x_p = self.relu(self.prop_bn2(x_p))
+
+        x_p = scatter_mean(x_p, batch_p, dim=0)
+
+        return x_p 
+
+class GCN_Net(nn.Module):
+    def __init__(self, in_dim_t, in_dim_p, hid_dim, out_dim):
+        super(GCN_Net, self).__init__()
+        self.encoder = RGCN(in_dim_t, in_dim_p, hid_dim, out_dim)
+        self.fc = nn.Linear(out_dim, 2)
+        self.relu = nn.LeakyReLU(negative_slope=0.01)
+
+        # contrastive learning
+        self.online_encoder = SimSiamMLP(out_dim, out_dim, 1024)
+        self.online_predictor = MLP(out_dim, out_dim, 1024)
+
+    def forward(self, data, CL=False):
+        x_p = self.encoder(data)
+
+        logit = self.fc(x_p)
+        logit = F.log_softmax(logit, dim=1)
+
+        if CL:
+            loss = self.gcl(data, x_p)
+            return logit, loss
+        else:  
+            return logit
+
+    def gcl(self, data, x_0):
+        x_1 = self.encoder(data, CL=True)
+
+        loss = self.simsiam(x_0, x_1)
+        return loss.mean()
+
+    def simsiam(self, x, y):
+        online_proj_x = self.online_encoder(x)
+        online_pred_x = self.online_predictor(online_proj_x)
+        target_proj_x = online_proj_x.detach()
+
+        online_proj_y = self.online_encoder(y)
+        online_pred_y = self.online_predictor(online_proj_y)
+        target_proj_y = online_proj_y.detach()
+
+        loss = self.loss_fn(online_pred_x, target_proj_y) + self.loss_fn(online_pred_y, target_proj_x)
+        return loss
+
+    def loss_fn(self, x, y):
+        x = F.normalize(x, dim=-1, p=2)
+        y = F.normalize(y, dim=-1, p=2)
+        return 2 - 2*(x * y).sum(dim=-1)
+
+def train_GCN(x_test, x_train, args, experiment_id, iter, fold):
+    model = GCN_Net(in_dim_t=768, in_dim_p=11, hid_dim=64, out_dim=64).to(device) 
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True)
+    traindata_list, testdata_list = loadMixDataGcl(x_train, x_test, args.min_droprate, args.max_droprate, args.drop_prob, 0., 120.)
+    train_loader = DataLoader(traindata_list, batch_size=args.bsize, shuffle=True, num_workers=8, follow_batch=['x_t', 'x_t_1', 'x_p', 'x_p_1'])
+    test_loader = DataLoader(testdata_list, batch_size=args.bsize, shuffle=True, num_workers=8, follow_batch=['x_t', 'x_t_1', 'x_p', 'x_p_1'])     
+
+    for epoch in range(args.epochs): 
+        model.train() 
+        for Batch_data in tqdm(train_loader):
+            Batch_data.to(device)
+            out_labels, cl_loss = model(Batch_data, CL=True)
+            finalloss = F.nll_loss(out_labels, Batch_data.y)
+            loss = finalloss + cl_loss*args.beta
+  
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        pred, true = [], []
+        for Batch_data in tqdm(test_loader):
+            with torch.no_grad():
+                Batch_data.to(device)
+                val_out = model(Batch_data)
+
+            pred.append(val_out.cpu())
+            true.append(Batch_data.y.cpu())
+
+        pred = torch.cat(pred)
+        true = torch.cat(true)
+        val_loss = F.nll_loss(pred, true)
+        _, val_pred = pred.max(dim=1)
+        correct = val_pred.eq(true).sum().item()
+        val_acc = correct / len(true) 
+
+        Acc_all, Acc1, Acc2, Prec1, Prec2, Recll1, Recll2, F1, F2 = evaluationclass(val_pred, true)
+
+        res = [ 'Epoch {:03d}'.format(epoch), 
+                'acc:{:.4f}'.format(Acc_all),
+                'C1:{:.4f},{:.4f},{:.4f},{:.4f}'.format(Acc1, Prec1, Recll1, F1),
+                'C2:{:.4f},{:.4f},{:.4f},{:.4f}'.format(Acc2, Prec2, Recll2, F2)]
+        print('results:', res)
+        early_stopping(val_loss, val_acc, Prec1, Prec2, Recll1, Recll2, F1, F2, model, experiment_id, args.ckpt_dir, iter, fold)
+                     
+        accs = val_acc
+        pre1 = Prec1
+        pre2 = Prec2
+        rec1 = Recll1
+        rec2 = Recll2
+        F1 = F1
+        F2 = F2
+
+        if early_stopping.early_stop:
+            print("Early stopping")
+            accs = early_stopping.accs
+            pre1 = early_stopping.pre1
+            pre2 = early_stopping.pre2
+            rec1 = early_stopping.rec1
+            rec2 = early_stopping.rec2        
+            F1 = early_stopping.F1
+            F2 = early_stopping.F2
+            break
+    return accs, pre1, pre2, rec1, rec2, F1, F2
+
+if __name__ == '__main__':    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--log_dir', default='../logs/Ours_prop/')
+    parser.add_argument('--ckpt_dir', default='../ckpt/Ours_prop/')
+    parser.add_argument('--bsize', default=128, type=int)
+    parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('--lr', default=5e-4, type=float)
+    parser.add_argument('--weight_decay', default=1e-4, type=float)
+    parser.add_argument('--patience', default=40, type=int)
+    parser.add_argument('--min_droprate', default=0.1, type=float)
+    parser.add_argument('--max_droprate', default=0.4, type=float)
+    parser.add_argument('--drop_prob', default=1., type=float)
+    parser.add_argument('--beta', default=0.1, type=float)
+    parser.add_argument('--iterations', default=10, type=int)
+    parser.add_argument('--cuda', action='store_true', default=False)
+    parser.add_argument('--gpu', default='0', type=str)
+    args = parser.parse_args()
+    print(vars(args))
+    
+    experiment_id = datetime.now().strftime("%Y_%m_%d_%H_%M_%S") 
+    print('experiment_id:', experiment_id)
+
+    os.makedirs(os.path.join(args.log_dir), exist_ok=True)
+    logging.basicConfig(
+        filename=os.path.join(args.log_dir, '{}.log'.format(experiment_id)),
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )    
+
+    device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() else 'cpu')
+    logger = logging.getLogger(__name__)
+    logger.info(str(vars(args)))
+
+    test_accs = []
+    FR_Pre, FR_Rec, FR_F1 = [], [], []
+    NR_Pre, NR_Rec, NR_F1 = [], [], []
+    for iter in range(args.iterations):
+        fold0_x_test, fold0_x_train, \
+        fold1_x_test, fold1_x_train, \
+        fold2_x_test, fold2_x_train, \
+        fold3_x_test, fold3_x_train, \
+        fold4_x_test, fold4_x_train = load5foldData(iter)
+        
+        accs0, Pre1_0, Pre2_0, Rec1_0, Rec2_0, F1_0, F2_0 = train_GCN(fold0_x_test, fold0_x_train, args, experiment_id, iter, 0)
+        accs1, Pre1_1, Pre2_1, Rec1_1, Rec2_1, F1_1, F2_1 = train_GCN(fold1_x_test, fold1_x_train, args, experiment_id, iter, 1)
+        accs2, Pre1_2, Pre2_2, Rec1_2, Rec2_2, F1_2, F2_2 = train_GCN(fold2_x_test, fold2_x_train, args, experiment_id, iter, 2)
+        accs3, Pre1_3, Pre2_3, Rec1_3, Rec2_3, F1_3, F2_3 = train_GCN(fold3_x_test, fold3_x_train, args, experiment_id, iter, 3)
+        accs4, Pre1_4, Pre2_4, Rec1_4, Rec2_4, F1_4, F2_4 = train_GCN(fold4_x_test, fold4_x_train, args, experiment_id, iter, 4)
+
+        test_accs.append((accs0+accs1+accs2+accs3+accs4)/5)
+
+        FR_Pre.append((Pre1_0+Pre1_1+Pre1_2+Pre1_3+Pre1_4)/5)
+        FR_Rec.append((Rec1_0+Rec1_1+Rec1_2+Rec1_3+Rec1_4)/5)
+        FR_F1.append((F1_0+F1_1+F1_2+F1_3+F1_4)/5)
+
+        NR_Pre.append((Pre2_0+Pre2_1+Pre2_2+Pre2_3+Pre2_4)/5)
+        NR_Rec.append((Rec2_0+Rec2_1+Rec2_2+Rec2_3+Rec2_4)/5)
+        NR_F1.append((F2_0 + F2_1 + F2_2 + F2_3 + F2_4) / 5)
+
+        logger.info("Iteration {:03d}, Test_Accuracy: {:.4f}|FR Pre: {:.4f}|NR Pre: {:.4f}|FR Rec: {:.4f}|NR Rec: {:.4f}|FR F1: {:.4f}|NR F1: {:.4f}".format(
+            iter, test_accs[-1], FR_Pre[-1], NR_Pre[-1], FR_Rec[-1], NR_Rec[-1], FR_F1[-1], NR_F1[-1]))  
+        
+        print("Iteration {:03d}, Test_Accuracy: {:.4f}|FR Pre: {:.4f}|NR Pre: {:.4f}|FR Rec: {:.4f}|NR Rec: {:.4f}|FR F1: {:.4f}|NR F1: {:.4f}".format(
+            iter, test_accs[-1], FR_Pre[-1], NR_Pre[-1], FR_Rec[-1], NR_Rec[-1], FR_F1[-1], NR_F1[-1]))
+
+    logger.info("Total, Test_Accuracy: {:.4f}|FR Pre: {:.4f}|NR Pre: {:.4f}|FR Rec: {:.4f}|NR Rec: {:.4f}|FR F1: {:.4f}|NR F1: {:.4f}".format(
+            np.mean(test_accs), np.mean(FR_Pre), np.mean(NR_Pre), np.mean(FR_Rec), np.mean(NR_Rec), np.mean(FR_F1), np.mean(NR_F1)))    
+    print("Total, Test_Accuracy: {:.4f}|FR Pre: {:.4f}|NR Pre: {:.4f}|FR Rec: {:.4f}|NR Rec: {:.4f}|FR F1: {:.4f}|NR F1: {:.4f}".format(
+            np.mean(test_accs), np.mean(FR_Pre), np.mean(NR_Pre), np.mean(FR_Rec), np.mean(NR_Rec), np.mean(FR_F1), np.mean(NR_F1))) 
+
+
